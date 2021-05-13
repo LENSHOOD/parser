@@ -25,6 +25,7 @@ import (
 %}
 
 %union {
+	offset  int
 	ident   string
 	number  uint64
 	hint    *ast.TableOptimizerHint
@@ -102,7 +103,8 @@ import (
 	hintTimeRange             "TIME_RANGE"
 	hintUseCascades           "USE_CASCADES"
 	hintNthPlan               "NTH_PLAN"
-	hintTopNToCop             "TOPN_TO_COP"
+	hintLimitToCop            "LIMIT_TO_COP"
+	hintForceIndex            "FORCE_INDEX"
 
 	/* Other keywords */
 	hintOLAP            "OLAP"
@@ -254,8 +256,13 @@ TableOptimizerHintOpt:
 	}
 |	"SET_VAR" '(' Identifier '=' Value ')'
 	{
-		parser.warnUnsupportedHint($1)
-		$$ = nil
+		$$ = &ast.TableOptimizerHint{
+			HintName: model.NewCIStr($1),
+			HintData: ast.HintSetVar{
+				VarName: $3,
+				Value:   $5,
+			},
+		}
 	}
 |	"RESOURCE_GROUP" '(' Identifier ')'
 	{
@@ -548,6 +555,7 @@ SupportedIndexLevelOptimizerHintName:
 	"USE_INDEX"
 |	"IGNORE_INDEX"
 |	"USE_INDEX_MERGE"
+|	"FORCE_INDEX"
 
 SubqueryOptimizerHintName:
 	"SEMIJOIN"
@@ -568,7 +576,7 @@ NullaryHintName:
 |	"HASH_AGG"
 |	"STREAM_AGG"
 |	"AGG_TO_COP"
-|	"TOPN_TO_COP"
+|	"LIMIT_TO_COP"
 |	"NO_INDEX_MERGE"
 |	"READ_CONSISTENT_REPLICA"
 |	"IGNORE_PLAN_CACHE"
@@ -612,7 +620,7 @@ Identifier:
 |	"QB_NAME"
 /* TiDB hint names */
 |	"AGG_TO_COP"
-|	"TOPN_TO_COP"
+|	"LIMIT_TO_COP"
 |	"IGNORE_PLAN_CACHE"
 |	"HASH_AGG"
 |	"IGNORE_INDEX"
@@ -636,6 +644,7 @@ Identifier:
 |	"TIME_RANGE"
 |	"USE_CASCADES"
 |	"NTH_PLAN"
+|	"FORCE_INDEX"
 /* other keywords */
 |	"OLAP"
 |	"OLTP"

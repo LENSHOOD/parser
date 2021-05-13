@@ -147,7 +147,7 @@ func (s *testHintParserSuite) TestParseHint(c *C) {
 			},
 		},
 		{
-			input: "USE_INDEX_MERGE(@qb1 tbl1 x, y, z) IGNORE_INDEX(tbl2@qb2) USE_INDEX(tbl3 PRIMARY)",
+			input: "USE_INDEX_MERGE(@qb1 tbl1 x, y, z) IGNORE_INDEX(tbl2@qb2) USE_INDEX(tbl3 PRIMARY) FORCE_INDEX(tbl4@qb3 c1)",
 			output: []*ast.TableOptimizerHint{
 				{
 					HintName: model.NewCIStr("USE_INDEX_MERGE"),
@@ -163,6 +163,11 @@ func (s *testHintParserSuite) TestParseHint(c *C) {
 					HintName: model.NewCIStr("USE_INDEX"),
 					Tables:   []ast.HintTable{{TableName: model.NewCIStr("tbl3")}},
 					Indexes:  []model.CIStr{model.NewCIStr("PRIMARY")},
+				},
+				{
+					HintName: model.NewCIStr("FORCE_INDEX"),
+					Tables:   []ast.HintTable{{TableName: model.NewCIStr("tbl4"), QBName: model.NewCIStr("qb3")}},
+					Indexes:  []model.CIStr{model.NewCIStr("c1")},
 				},
 			},
 		},
@@ -191,12 +196,43 @@ func (s *testHintParserSuite) TestParseHint(c *C) {
 			},
 		},
 		{
-			input: `SET_VAR(sbs = 16M) SET_VAR(fkc=OFF) SET_VAR(os="mcb=off") set_var(abc=1)`,
-			errs: []string{
-				`.*Optimizer hint SET_VAR is not supported.*`,
-				`.*Optimizer hint SET_VAR is not supported.*`,
-				`.*Optimizer hint SET_VAR is not supported.*`,
-				`.*Optimizer hint set_var is not supported.*`,
+			input: `SET_VAR(sbs = 16M) SET_VAR(fkc=OFF) SET_VAR(os="mcb=off") set_var(abc=1) set_var(os2='mcb2=off')`,
+			output: []*ast.TableOptimizerHint{
+				{
+					HintName: model.NewCIStr("SET_VAR"),
+					HintData: ast.HintSetVar{
+						VarName: "sbs",
+						Value:   "16M",
+					},
+				},
+				{
+					HintName: model.NewCIStr("SET_VAR"),
+					HintData: ast.HintSetVar{
+						VarName: "fkc",
+						Value:   "OFF",
+					},
+				},
+				{
+					HintName: model.NewCIStr("SET_VAR"),
+					HintData: ast.HintSetVar{
+						VarName: "os",
+						Value:   "mcb=off",
+					},
+				},
+				{
+					HintName: model.NewCIStr("set_var"),
+					HintData: ast.HintSetVar{
+						VarName: "abc",
+						Value:   "1",
+					},
+				},
+				{
+					HintName: model.NewCIStr("set_var"),
+					HintData: ast.HintSetVar{
+						VarName: "os2",
+						Value:   "mcb2=off",
+					},
+				},
 			},
 		},
 		{

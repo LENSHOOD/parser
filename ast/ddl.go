@@ -25,6 +25,7 @@ import (
 
 var (
 	_ DDLNode = &AlterTableStmt{}
+	_ DDLNode = &AlterSequenceStmt{}
 	_ DDLNode = &CreateDatabaseStmt{}
 	_ DDLNode = &CreateIndexStmt{}
 	_ DDLNode = &CreateTableStmt{}
@@ -51,6 +52,12 @@ var (
 type CharsetOpt struct {
 	Chs string
 	Col string
+}
+
+// NullString represents a string that may be nil.
+type NullString struct {
+	String string
+	Empty  bool // Empty is true if String is empty backtick.
 }
 
 // DatabaseOptionType is the type for database options.
@@ -323,13 +330,15 @@ func (n *ReferenceDef) Accept(v Visitor) (Node, bool) {
 		return v.Leave(newNode)
 	}
 	n = newNode.(*ReferenceDef)
-	node, ok := n.Table.Accept(v)
-	if !ok {
-		return n, false
+	if n.Table != nil {
+		node, ok := n.Table.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Table = node.(*TableName)
 	}
-	n.Table = node.(*TableName)
 	for i, val := range n.IndexPartSpecifications {
-		node, ok = val.Accept(v)
+		node, ok := val.Accept(v)
 		if !ok {
 			return n, false
 		}
@@ -479,6 +488,7 @@ type ColumnOption struct {
 	Enforced bool
 	// Name is only used for Check Constraint name.
 	ConstraintName string
+	PrimaryKeyTp   model.PrimaryKeyType
 }
 
 // Restore implements Node interface.
@@ -488,6 +498,11 @@ func (n *ColumnOption) Restore(ctx *format.RestoreCtx) error {
 		return nil
 	case ColumnOptionPrimaryKey:
 		ctx.WriteKeyWord("PRIMARY KEY")
+		pkTp := n.PrimaryKeyTp.String()
+		if len(pkTp) != 0 {
+			ctx.WritePlain(" ")
+			ctx.WriteKeyWord(pkTp)
+		}
 	case ColumnOptionNotNull:
 		ctx.WriteKeyWord("NOT NULL")
 	case ColumnOptionAutoIncrement:
@@ -610,12 +625,20 @@ type IndexOption struct {
 	Comment      string
 	ParserName   model.CIStr
 	Visibility   IndexVisibility
+	PrimaryKeyTp model.PrimaryKeyType
 }
 
 // Restore implements Node interface.
 func (n *IndexOption) Restore(ctx *format.RestoreCtx) error {
 	hasPrevOption := false
+	if n.PrimaryKeyTp != model.PrimaryKeyTypeDefault {
+		ctx.WriteKeyWord(n.PrimaryKeyTp.String())
+		hasPrevOption = true
+	}
 	if n.KeyBlockSize > 0 {
+		if hasPrevOption {
+			ctx.WritePlain(" ")
+		}
 		ctx.WriteKeyWord("KEY_BLOCK_SIZE")
 		ctx.WritePlainf("=%d", n.KeyBlockSize)
 		hasPrevOption = true
@@ -713,6 +736,7 @@ type Constraint struct {
 	InColumn bool // Used for Check
 
 	InColumnName string // Used for Check
+	IsEmptyIndex bool   // Used for Check
 }
 
 // Restore implements Node interface.
@@ -770,7 +794,7 @@ func (n *Constraint) Restore(ctx *format.RestoreCtx) error {
 		if n.IfNotExists {
 			ctx.WriteKeyWord("IF NOT EXISTS ")
 		}
-	} else if n.Name != "" {
+	} else if n.Name != "" || n.IsEmptyIndex {
 		ctx.WritePlain(" ")
 		ctx.WriteName(n.Name)
 	}
@@ -830,6 +854,13 @@ func (n *Constraint) Accept(v Visitor) (Node, bool) {
 			return n, false
 		}
 		n.Option = node.(*IndexOption)
+	}
+	if n.Expr != nil {
+		node, ok := n.Expr.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Expr = node.(ExprNode)
 	}
 	return v.Leave(n)
 }
@@ -902,29 +933,44 @@ func (n *ColumnDef) Validate() bool {
 	return !(generatedCol && illegalOpt4gc)
 }
 
+type TemporaryKeyword int
+
+const (
+	TemporaryNone TemporaryKeyword = iota
+	TemporaryGlobal
+	TemporaryLocal
+)
+
 // CreateTableStmt is a statement to create a table.
 // See https://dev.mysql.com/doc/refman/5.7/en/create-table.html
 type CreateTableStmt struct {
 	ddlNode
 
 	IfNotExists bool
-	IsTemporary bool
-	Table       *TableName
-	ReferTable  *TableName
-	Cols        []*ColumnDef
-	Constraints []*Constraint
-	Options     []*TableOption
-	Partition   *PartitionOptions
-	OnDuplicate OnDuplicateKeyHandlingType
-	Select      ResultSetNode
+	TemporaryKeyword
+	// Meanless when TemporaryKeyword is not TemporaryGlobal.
+	// ON COMMIT DELETE ROWS => true
+	// ON COMMIT PRESERVE ROW => false
+	OnCommitDelete bool
+	Table          *TableName
+	ReferTable     *TableName
+	Cols           []*ColumnDef
+	Constraints    []*Constraint
+	Options        []*TableOption
+	Partition      *PartitionOptions
+	OnDuplicate    OnDuplicateKeyHandlingType
+	Select         ResultSetNode
 }
 
 // Restore implements Node interface.
 func (n *CreateTableStmt) Restore(ctx *format.RestoreCtx) error {
-	if n.IsTemporary {
-		ctx.WriteKeyWord("CREATE TEMPORARY TABLE ")
-	} else {
+	switch n.TemporaryKeyword {
+	case TemporaryNone:
 		ctx.WriteKeyWord("CREATE TABLE ")
+	case TemporaryGlobal:
+		ctx.WriteKeyWord("CREATE GLOBAL TEMPORARY TABLE ")
+	case TemporaryLocal:
+		ctx.WriteKeyWord("CREATE TEMPORARY TABLE ")
 	}
 	if n.IfNotExists {
 		ctx.WriteKeyWord("IF NOT EXISTS ")
@@ -933,9 +979,9 @@ func (n *CreateTableStmt) Restore(ctx *format.RestoreCtx) error {
 	if err := n.Table.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while splicing CreateTableStmt Table")
 	}
-	ctx.WritePlain(" ")
+
 	if n.ReferTable != nil {
-		ctx.WriteKeyWord("LIKE ")
+		ctx.WriteKeyWord(" LIKE ")
 		if err := n.ReferTable.Restore(ctx); err != nil {
 			return errors.Annotate(err, "An error occurred while splicing CreateTableStmt ReferTable")
 		}
@@ -943,7 +989,7 @@ func (n *CreateTableStmt) Restore(ctx *format.RestoreCtx) error {
 	lenCols := len(n.Cols)
 	lenConstraints := len(n.Constraints)
 	if lenCols+lenConstraints > 0 {
-		ctx.WritePlain("(")
+		ctx.WritePlain(" (")
 		for i, col := range n.Cols {
 			if i > 0 {
 				ctx.WritePlain(",")
@@ -989,6 +1035,14 @@ func (n *CreateTableStmt) Restore(ctx *format.RestoreCtx) error {
 
 		if err := n.Select.Restore(ctx); err != nil {
 			return errors.Annotate(err, "An error occurred while splicing CreateTableStmt Select")
+		}
+	}
+
+	if n.TemporaryKeyword == TemporaryGlobal {
+		if n.OnCommitDelete {
+			ctx.WriteKeyWord(" ON COMMIT DELETE ROWS")
+		} else {
+			ctx.WriteKeyWord(" ON COMMIT PRESERVE ROWS")
 		}
 	}
 
@@ -1051,10 +1105,10 @@ func (n *CreateTableStmt) Accept(v Visitor) (Node, bool) {
 type DropTableStmt struct {
 	ddlNode
 
-	IfExists    bool
-	Tables      []*TableName
-	IsView      bool
-	IsTemporary bool // make sense ONLY if/when IsView == false
+	IfExists         bool
+	Tables           []*TableName
+	IsView           bool
+	TemporaryKeyword // make sense ONLY if/when IsView == false
 }
 
 // Restore implements Node interface.
@@ -1062,10 +1116,13 @@ func (n *DropTableStmt) Restore(ctx *format.RestoreCtx) error {
 	if n.IsView {
 		ctx.WriteKeyWord("DROP VIEW ")
 	} else {
-		if n.IsTemporary {
-			ctx.WriteKeyWord("DROP TEMPORARY TABLE ")
-		} else {
+		switch n.TemporaryKeyword {
+		case TemporaryNone:
 			ctx.WriteKeyWord("DROP TABLE ")
+		case TemporaryGlobal:
+			ctx.WriteKeyWord("DROP GLOBAL TEMPORARY TABLE ")
+		case TemporaryLocal:
+			ctx.WriteKeyWord("DROP TEMPORARY TABLE ")
 		}
 	}
 	if n.IfExists {
@@ -1149,11 +1206,6 @@ func (n *DropSequenceStmt) Accept(v Visitor) (Node, bool) {
 type RenameTableStmt struct {
 	ddlNode
 
-	OldTable *TableName
-	NewTable *TableName
-
-	// TableToTables is only useful for syncer which depends heavily on tidb parser to do some dirty work for now.
-	// TODO: Refactor this when you are going to add full support for multiple schema changes.
 	TableToTables []*TableToTable
 }
 
@@ -1178,16 +1230,6 @@ func (n *RenameTableStmt) Accept(v Visitor) (Node, bool) {
 		return v.Leave(newNode)
 	}
 	n = newNode.(*RenameTableStmt)
-	node, ok := n.OldTable.Accept(v)
-	if !ok {
-		return n, false
-	}
-	n.OldTable = node.(*TableName)
-	node, ok = n.NewTable.Accept(v)
-	if !ok {
-		return n, false
-	}
-	n.NewTable = node.(*TableName)
 
 	for i, t := range n.TableToTables {
 		node, ok := t.Accept(v)
@@ -2037,6 +2079,9 @@ const (
 	SequenceCache
 	SequenceNoCycle
 	SequenceCycle
+	// SequenceRestart is only used in alter sequence statement.
+	SequenceRestart
+	SequenceRestartWith
 )
 
 // SequenceOption is used for parsing sequence option from SQL.
@@ -2072,6 +2117,11 @@ func (n *SequenceOption) Restore(ctx *format.RestoreCtx) error {
 		ctx.WriteKeyWord("NOCYCLE")
 	case SequenceCycle:
 		ctx.WriteKeyWord("CYCLE")
+	case SequenceRestart:
+		ctx.WriteKeyWord("RESTART")
+	case SequenceRestartWith:
+		ctx.WriteKeyWord("RESTART WITH ")
+		ctx.WritePlainf("%d", n.IntValue)
 	default:
 		return errors.Errorf("invalid SequenceOption: %d", n.Tp)
 	}
@@ -2150,6 +2200,7 @@ const (
 	AlterTableRenameTable
 	AlterTableAlterColumn
 	AlterTableLock
+	AlterTableWriteable
 	AlterTableAlgorithm
 	AlterTableRenameIndex
 	AlterTableForce
@@ -2184,6 +2235,8 @@ const (
 	// AlterTableSetTiFlashReplica uses to set the table TiFlash replica.
 	AlterTableSetTiFlashReplica
 	AlterTablePlacement
+	AlterTableAddStatistics
+	AlterTableDropStatistics
 )
 
 // LockType is the type for AlterTableSpec.
@@ -2281,6 +2334,8 @@ type AlterTableSpec struct {
 	Visibility      IndexVisibility
 	TiFlashReplica  *TiFlashReplicaSpec
 	PlacementSpecs  []*PlacementSpec
+	Writeable       bool
+	Statistics      *StatisticsSpec
 }
 
 type TiFlashReplicaSpec struct {
@@ -2322,6 +2377,35 @@ func (n *AlterTableSpec) Restore(ctx *format.RestoreCtx) error {
 			}
 			ctx.WriteString(v)
 		}
+	case AlterTableAddStatistics:
+		ctx.WriteKeyWord("ADD STATS_EXTENDED ")
+		if n.IfNotExists {
+			ctx.WriteKeyWord("IF NOT EXISTS ")
+		}
+		ctx.WriteName(n.Statistics.StatsName)
+		switch n.Statistics.StatsType {
+		case StatsTypeCardinality:
+			ctx.WriteKeyWord(" CARDINALITY(")
+		case StatsTypeDependency:
+			ctx.WriteKeyWord(" DEPENDENCY(")
+		case StatsTypeCorrelation:
+			ctx.WriteKeyWord(" CORRELATION(")
+		}
+		for i, col := range n.Statistics.Columns {
+			if i != 0 {
+				ctx.WritePlain(", ")
+			}
+			if err := col.Restore(ctx); err != nil {
+				return errors.Annotatef(err, "An error occurred while restore AddStatisticsSpec.Columns: [%v]", i)
+			}
+		}
+		ctx.WritePlain(")")
+	case AlterTableDropStatistics:
+		ctx.WriteKeyWord("DROP STATS_EXTENDED ")
+		if n.IfExists {
+			ctx.WriteKeyWord("IF EXISTS ")
+		}
+		ctx.WriteName(n.Statistics.StatsName)
 	case AlterTableOption:
 		switch {
 		case len(n.Options) == 2 && n.Options[0].Tp == TableOptionCharset && n.Options[1].Tp == TableOptionCollate:
@@ -2344,7 +2428,7 @@ func (n *AlterTableSpec) Restore(ctx *format.RestoreCtx) error {
 		default:
 			for i, opt := range n.Options {
 				if i != 0 {
-					ctx.WritePlain(", ")
+					ctx.WritePlain(" ")
 				}
 				if err := opt.Restore(ctx); err != nil {
 					return errors.Annotatef(err, "An error occurred while restore AlterTableSpec.Options[%d]", i)
@@ -2487,6 +2571,13 @@ func (n *AlterTableSpec) Restore(ctx *format.RestoreCtx) error {
 		ctx.WriteKeyWord("LOCK ")
 		ctx.WritePlain("= ")
 		ctx.WriteKeyWord(n.LockType.String())
+	case AlterTableWriteable:
+		ctx.WriteKeyWord("READ ")
+		if n.Writeable {
+			ctx.WriteKeyWord("WRITE")
+		} else {
+			ctx.WriteKeyWord("ONLY")
+		}
 	case AlterTableOrderByColumns:
 		ctx.WriteKeyWord("ORDER BY ")
 		for i, alterOrderItem := range n.OrderByList {
@@ -2777,19 +2868,19 @@ func (n *AlterTableSpec) Accept(v Visitor) (Node, bool) {
 		}
 		n.NewTable = node.(*TableName)
 	}
-	for _, col := range n.NewColumns {
+	for i, col := range n.NewColumns {
 		node, ok := col.Accept(v)
 		if !ok {
 			return n, false
 		}
-		col = node.(*ColumnDef)
+		n.NewColumns[i] = node.(*ColumnDef)
 	}
-	for _, constraint := range n.NewConstraints {
+	for i, constraint := range n.NewConstraints {
 		node, ok := constraint.Accept(v)
 		if !ok {
 			return n, false
 		}
-		constraint = node.(*Constraint)
+		n.NewConstraints[i] = node.(*Constraint)
 	}
 	if n.OldColumnName != nil {
 		node, ok := n.OldColumnName.Accept(v)
@@ -2804,6 +2895,18 @@ func (n *AlterTableSpec) Accept(v Visitor) (Node, bool) {
 			return n, false
 		}
 		n.Position = node.(*ColumnPosition)
+	}
+	if n.Partition != nil {
+		node, ok := n.Partition.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Partition = node.(*PartitionOptions)
+	}
+	for _, def := range n.PartDefinitions {
+		if !def.acceptInPlace(v) {
+			return n, false
+		}
 	}
 	for i, spec := range n.PlacementSpecs {
 		node, ok := spec.Accept(v)
@@ -3543,5 +3646,47 @@ func (n *PlacementSpec) Accept(v Visitor) (Node, bool) {
 		return v.Leave(newNode)
 	}
 	n = newNode.(*PlacementSpec)
+	return v.Leave(n)
+}
+
+// AlterSequenceStmt is a statement to alter sequence option.
+type AlterSequenceStmt struct {
+	ddlNode
+
+	// sequence name
+	Name *TableName
+
+	IfExists   bool
+	SeqOptions []*SequenceOption
+}
+
+func (n *AlterSequenceStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("ALTER SEQUENCE ")
+	if n.IfExists {
+		ctx.WriteKeyWord("IF EXISTS ")
+	}
+	if err := n.Name.Restore(ctx); err != nil {
+		return errors.Annotate(err, "An error occurred while restore AlterSequenceStmt.Table")
+	}
+	for i, option := range n.SeqOptions {
+		ctx.WritePlain(" ")
+		if err := option.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while splicing AlterSequenceStmt SequenceOption: [%v]", i)
+		}
+	}
+	return nil
+}
+
+func (n *AlterSequenceStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*AlterSequenceStmt)
+	node, ok := n.Name.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Name = node.(*TableName)
 	return v.Leave(n)
 }

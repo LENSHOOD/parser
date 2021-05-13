@@ -42,8 +42,10 @@ const (
 	StateDeleteReorganization
 	// StatePublic means this schema element is ok for all write and read operations.
 	StatePublic
-	// StateReplica means we're waiting tiflash replica to be finished.
+	// StateReplicaOnly means we're waiting tiflash replica to be finished.
 	StateReplicaOnly
+	// StateGlobalTxnOnly means we can only use global txn for operator on this schema element
+	StateGlobalTxnOnly
 	/*
 	 *  Please add the new state at the end to keep the values consistent across versions.
 	 */
@@ -64,8 +66,10 @@ func (s SchemaState) String() string {
 		return "public"
 	case StateReplicaOnly:
 		return "replica only"
+	case StateGlobalTxnOnly:
+		return "global txn only"
 	default:
-		return "none"
+		return "queueing"
 	}
 }
 
@@ -130,7 +134,7 @@ func (c *ColumnInfo) IsGenerated() bool {
 	return len(c.GeneratedExprString) != 0
 }
 
-// SetOriginalDefaultValue sets the origin default value.
+// SetOriginDefaultValue sets the origin default value.
 // For mysql.TypeBit type, the default value storage format must be a string.
 // Other value such as int must convert to string format first.
 // The mysql.TypeBit type supports the null default value.
@@ -149,7 +153,7 @@ func (c *ColumnInfo) SetOriginDefaultValue(value interface{}) error {
 	return nil
 }
 
-// GetOriginalDefaultValue gets the origin default value.
+// GetOriginDefaultValue gets the origin default value.
 func (c *ColumnInfo) GetOriginDefaultValue() interface{} {
 	if c.Tp == mysql.TypeBit && c.OriginDefaultValueBit != nil {
 		// If the column type is BIT, both `OriginDefaultValue` and `DefaultValue` of ColumnInfo are corrupted,
@@ -216,6 +220,9 @@ func FindColumnInfo(cols []*ColumnInfo, name string) *ColumnInfo {
 // for use of execution phase.
 const ExtraHandleID = -1
 
+// ExtraPidColID is the column ID of column which store the partitionID decoded in global index values.
+const ExtraPidColID = -2
+
 const (
 	// TableInfoVersion0 means the table info version is 0.
 	// Upgrade from v2.1.1 or v2.1.2 to v2.1.3 and later, and then execute a "change/modify column" statement
@@ -241,13 +248,21 @@ const (
 	// However, the convert is missed in some scenarios before v2.1.9, so for all those tables prior to TableInfoVersion3, their
 	// charsets / collations will be converted to lower-case while loading from the storage.
 	TableInfoVersion3 = uint16(3)
+	// TableInfoVersion4 indicates that the auto_increment allocator in TiDB has been separated from
+	// _tidb_rowid allocator. This version is introduced to preserve the compatibility of old tables:
+	// the tables with version < TableInfoVersion4 still use a single allocator for auto_increment and _tidb_rowid.
+	// Also see https://github.com/pingcap/tidb/issues/982.
+	TableInfoVersion4 = uint16(4)
 
 	// CurrLatestTableInfoVersion means the latest table info in the current TiDB.
-	CurrLatestTableInfoVersion = TableInfoVersion3
+	CurrLatestTableInfoVersion = TableInfoVersion4
 )
 
 // ExtraHandleName is the name of ExtraHandle Column.
 var ExtraHandleName = NewCIStr("_tidb_rowid")
+
+// ExtraPartitionIdName is the name of ExtraPartitionId Column.
+var ExtraPartitionIdName = NewCIStr("_tidb_pid")
 
 // TableInfo provides meta data describing a DB table.
 type TableInfo struct {
@@ -266,6 +281,10 @@ type TableInfo struct {
 	// IsCommonHandle is true when clustered index feature is
 	// enabled and the primary key is not a single integer column.
 	IsCommonHandle bool `json:"is_common_handle"`
+	// CommonHandleVersion is the version of the clustered index.
+	// 0 for the clustered index created == 5.0.0 RC.
+	// 1 for the clustered index created > 5.0.0 RC.
+	CommonHandleVersion uint16 `json:"common_handle_version"`
 
 	Comment         string `json:"comment"`
 	AutoIncID       int64  `json:"auto_inc_id"`
@@ -316,6 +335,27 @@ type TableInfo struct {
 	// IsColumnar means the table is column-oriented.
 	// It's true when the engine of the table is TiFlash only.
 	IsColumnar bool `json:"is_columnar"`
+
+	TempTableType `json:"temp_table_type"`
+}
+
+type TempTableType byte
+
+const (
+	TempTableNone TempTableType = iota
+	TempTableGlobal
+	TempTableLocal
+)
+
+func (t TempTableType) String() string {
+	switch t {
+	case TempTableGlobal:
+		return "global"
+	case TempTableLocal:
+		return "local"
+	default:
+		return ""
+	}
 }
 
 // TableLockInfo provides meta data describing a table lock.
@@ -380,6 +420,9 @@ const (
 	TableLockRead
 	// TableLockReadLocal is not supported.
 	TableLockReadLocal
+	// TableLockReadOnly is used to set a table into read-only status,
+	// when the session exits, it will not release its lock automatically.
+	TableLockReadOnly
 	// TableLockWrite means only the session with this lock has write/read permission.
 	// Only the session that holds the lock can access the table. No other session can access it until the lock is released.
 	TableLockWrite
@@ -395,6 +438,8 @@ func (t TableLockType) String() string {
 		return "READ"
 	case TableLockReadLocal:
 		return "READ LOCAL"
+	case TableLockReadOnly:
+		return "READ ONLY"
 	case TableLockWriteLocal:
 		return "WRITE LOCAL"
 	case TableLockWrite:
@@ -553,7 +598,18 @@ func NewExtraHandleColInfo() *ColumnInfo {
 		ID:   ExtraHandleID,
 		Name: ExtraHandleName,
 	}
-	colInfo.Flag = mysql.PriKeyFlag
+	colInfo.Flag = mysql.PriKeyFlag | mysql.NotNullFlag
+	colInfo.Tp = mysql.TypeLonglong
+	colInfo.Flen, colInfo.Decimal = mysql.GetDefaultFieldLengthAndDecimal(mysql.TypeLonglong)
+	return colInfo
+}
+
+// NewExtraPartitionIDColInfo mocks a column info for extra partition id column.
+func NewExtraPartitionIDColInfo() *ColumnInfo {
+	colInfo := &ColumnInfo{
+		ID:   ExtraPidColID,
+		Name: ExtraPartitionIdName,
+	}
 	colInfo.Tp = mysql.TypeLonglong
 	colInfo.Flen, colInfo.Decimal = mysql.GetDefaultFieldLengthAndDecimal(mysql.TypeLonglong)
 	return colInfo
@@ -581,7 +637,12 @@ func (t *TableInfo) IsSequence() bool {
 	return t.Sequence != nil
 }
 
-// ViewAlgorithm is VIEW's SQL AlGORITHM characteristic.
+// IsBaseTable checks to see the table is neither a view or a sequence.
+func (t *TableInfo) IsBaseTable() bool {
+	return t.Sequence == nil && t.View == nil
+}
+
+// ViewAlgorithm is VIEW's SQL ALGORITHM characteristic.
 // See https://dev.mysql.com/doc/refman/5.7/en/view-algorithms.html
 type ViewAlgorithm int
 
@@ -686,10 +747,10 @@ type PartitionType int
 // Partition types.
 const (
 	PartitionTypeRange      PartitionType = 1
-	PartitionTypeHash                     = 2
-	PartitionTypeList                     = 3
-	PartitionTypeKey                      = 4
-	PartitionTypeSystemTime               = 5
+	PartitionTypeHash       PartitionType = 2
+	PartitionTypeList       PartitionType = 3
+	PartitionTypeKey        PartitionType = 4
+	PartitionTypeSystemTime PartitionType = 5
 )
 
 func (p PartitionType) String() string {
@@ -726,25 +787,78 @@ type PartitionInfo struct {
 	AddingDefinitions []PartitionDefinition `json:"adding_definitions"`
 	// DroppingDefinitions is filled when dropping a partition that is in the mid state.
 	DroppingDefinitions []PartitionDefinition `json:"dropping_definitions"`
+	States              []PartitionState      `json:"states"`
 	Num                 uint64                `json:"num"`
 }
 
 // GetNameByID gets the partition name by ID.
 func (pi *PartitionInfo) GetNameByID(id int64) string {
-	for _, def := range pi.Definitions {
-		if id == def.ID {
-			return def.Name.L
+	definitions := pi.Definitions
+	// do not convert this loop to `for _, def := range definitions`.
+	// see https://github.com/pingcap/parser/pull/1072 for the benchmark.
+	for i := range definitions {
+		if id == definitions[i].ID {
+			return definitions[i].Name.L
 		}
 	}
 	return ""
 }
 
+func (pi *PartitionInfo) GetStateByID(id int64) SchemaState {
+	for _, pstate := range pi.States {
+		if pstate.ID == id {
+			return pstate.State
+		}
+	}
+	return StatePublic
+}
+
+func (pi *PartitionInfo) SetStateByID(id int64, state SchemaState) {
+	newState := PartitionState{ID: id, State: state}
+	for i, pstate := range pi.States {
+		if pstate.ID == id {
+			pi.States[i] = newState
+			return
+		}
+	}
+	if pi.States == nil {
+		pi.States = make([]PartitionState, 0, 1)
+	}
+	pi.States = append(pi.States, newState)
+}
+
+func (pi *PartitionInfo) GCPartitionStates() {
+	if len(pi.States) < 1 {
+		return
+	}
+	newStates := make([]PartitionState, 0, len(pi.Definitions))
+	for _, state := range pi.States {
+		found := false
+		for _, def := range pi.Definitions {
+			if def.ID == state.ID {
+				found = true
+				break
+			}
+		}
+		if found {
+			newStates = append(newStates, state)
+		}
+	}
+	pi.States = newStates
+}
+
+type PartitionState struct {
+	ID    int64       `json:"id"`
+	State SchemaState `json:"state"`
+}
+
 // PartitionDefinition defines a single partition.
 type PartitionDefinition struct {
-	ID       int64    `json:"id"`
-	Name     CIStr    `json:"name"`
-	LessThan []string `json:"less_than"`
-	Comment  string   `json:"comment,omitempty"`
+	ID       int64      `json:"id"`
+	Name     CIStr      `json:"name"`
+	LessThan []string   `json:"less_than"`
+	InValues [][]string `json:"in_values"`
+	Comment  string     `json:"comment,omitempty"`
 }
 
 // Clone clones ConstraintInfo.
@@ -758,8 +872,9 @@ func (ci *PartitionDefinition) Clone() PartitionDefinition {
 // FindPartitionDefinitionByName finds PartitionDefinition by name.
 func (t *TableInfo) FindPartitionDefinitionByName(partitionDefinitionName string) *PartitionDefinition {
 	lowConstrName := strings.ToLower(partitionDefinitionName)
-	for i, pd := range t.Partition.Definitions {
-		if pd.Name.L == lowConstrName {
+	definitions := t.Partition.Definitions
+	for i := range definitions {
+		if definitions[i].Name.L == lowConstrName {
 			return &t.Partition.Definitions[i]
 		}
 	}
@@ -781,6 +896,27 @@ func (i *IndexColumn) Clone() *IndexColumn {
 	ni := *i
 	return &ni
 }
+
+// PrimaryKeyType is the type of primary key.
+// Available values are 'clustered', 'nonclustered', and ''(default).
+type PrimaryKeyType int8
+
+func (p PrimaryKeyType) String() string {
+	switch p {
+	case PrimaryKeyTypeClustered:
+		return "CLUSTERED"
+	case PrimaryKeyTypeNonClustered:
+		return "NONCLUSTERED"
+	default:
+		return ""
+	}
+}
+
+const (
+	PrimaryKeyTypeDefault PrimaryKeyType = iota
+	PrimaryKeyTypeClustered
+	PrimaryKeyTypeNonClustered
+)
 
 // IndexType is the type of index
 type IndexType int
